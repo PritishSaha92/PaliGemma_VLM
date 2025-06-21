@@ -1,9 +1,10 @@
 import torch
 from torch import nn
-from typing import Optional, Tuple, List
-from torch.nn import CrossEntropyLoss
 import math
+import enum
+from typing import Optional, Tuple, List
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
+
 
 class KVCache():
 
@@ -31,11 +32,17 @@ class KVCache():
         else:
             # ... otherwise we concatenate the new keys with the existing ones.
             # each tensor has shape: [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+            # print(self.key_cache[layer_idx].shape, key_states.shape)
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
 
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+
+class AttentionType(enum.Enum):
+    GLOBAL = 1
+    LOCAL_SLIDING = 2
 
 class GemmaConfig():
 
@@ -51,9 +58,10 @@ class GemmaConfig():
         max_position_embeddings=8192,
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
-        attention_bias=False,
         attention_dropout=0.0,
         pad_token_id=None,
+        query_pre_attn_scalar=None,
+        quant = False,
         **kwargs,
     ):
         super().__init__()
@@ -67,9 +75,19 @@ class GemmaConfig():
         self.num_key_value_heads = num_key_value_heads
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
-        self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.pad_token_id = pad_token_id
+        self.query_pre_attn_scalar = query_pre_attn_scalar
+        self.use_pre_ffw_norm = True
+        self.use_post_ffw_norm = True
+        self.final_logit_softcapping = 30.0
+        self.attn_logit_softcapping = 50.0
+        self.sliding_window_size=4096
+        assert self.num_hidden_layers % 2 == 0
+        self.attn_types=[AttentionType.LOCAL_SLIDING, AttentionType.GLOBAL] * int(self.num_hidden_layers/2)
+
+        assert quant == False, "quantized model version not yet supported"
+        self.quant = quant
 
 class PaliGemmaConfig():
 
@@ -105,21 +123,55 @@ class PaliGemmaConfig():
         self.vision_config.projection_dim = projection_dim
 
 
-class GemmaRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+class RMSNorm(torch.nn.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        add_unit_offset: bool = True,
+    ):
         super().__init__()
         self.eps = eps
+        self.add_unit_offset = add_unit_offset
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
+        # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
+        output = self._norm(x.float())
+        if self.add_unit_offset:
+            output = output * (1 + self.weight.float())
+        else:
+            output = output * self.weight.float()
         return output.type_as(x)
+
+
+class GemmaMLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant: bool,
+    ):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        gate = nn.functional.gelu(gate, approximate="tanh")
+        up = self.up_proj(x)
+        fuse = gate * up
+        outputs = self.down_proj(fuse)
+        return outputs
+
+
 
 class GemmaRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -129,7 +181,7 @@ class GemmaRotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
 
-        # Calculate the theta according to the formula theta_i = base^(2i/dim) where i = 0, 1, 2, ..., dim // 2
+        # Calculate the theta according to the formula theta_i = base^(-2i/dim) where i = 0, 1, 2, ..., dim // 2
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
 
@@ -167,87 +219,89 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension
     sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension
     # Apply the formula (34) of the Rotary Positional Encoding paper.
+    a = (q * cos)
+    a = (rotate_half(q) * sin)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
-class GemmaMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def forward(self, x):
-        # Equivalent to:
-        # y = self.gate_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
-        # y = torch.gelu(y, approximate="tanh") # [Batch_Size, Seq_Len, Intermediate_Size]
-        # j = self.up_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
-        # z = y * j # [Batch_Size, Seq_Len, Intermediate_Size]
-        # z = self.down_proj(z) # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
-        return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
 class GemmaAttention(nn.Module):
 
-    def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        attn_logit_softcapping: Optional[float],
+        query_pre_attn_scalar: Optional[int],
+        head_dim: int,
+        quant: bool,
+        attn_type: AttentionType,
+        config: GemmaConfig,
+        sliding_window_size: Optional[int] = None,
+    ):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
 
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
 
-        assert self.hidden_size % self.num_heads == 0            
+        assert self.num_heads % self.num_kv_heads == 0
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        if query_pre_attn_scalar is not None:
+            self.scaling = query_pre_attn_scalar**-0.5
+        else:
+            self.scaling = self.head_dim**-0.5
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.attn_type = attn_type
+        self.sliding_window_size = sliding_window_size
+        self.attn_logit_softcapping = attn_logit_softcapping
+        
+        self.rope_theta = getattr(config, 'rope_theta', 10000)
         self.rotary_emb = GemmaRotaryEmbedding(
             self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
+            max_position_embeddings=config.max_position_embeddings,
             base=self.rope_theta,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        kv_cache: Optional[KVCache] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
+        position_ids: torch.Tensor,
+        kv_cache: KVCache,
+        layer_idx: int,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states_shape = hidden_states.shape
+        assert len(hidden_states_shape) == 3
+
+        batch_size, input_len, _ = hidden_states_shape
+
         # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
         query_states = self.q_proj(hidden_states)
         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         key_states = self.k_proj(hidden_states)
         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         value_states = self.v_proj(hidden_states)
+
         # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
@@ -255,141 +309,172 @@ class GemmaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if kv_cache is not None:
-            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
+            key_states, value_states = kv_cache.update(key_states, value_states, layer_idx)
 
-        # Repeat the key and values to match the number of heads of the query
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if self.num_kv_heads != self.num_heads:
+            # [batch_size, max_seq_len, n_local_heads, head_dim]
+            key_states = torch.repeat_interleave(key_states, self.num_queries_per_kv, dim=1)
+            value_states = torch.repeat_interleave(value_states,self.num_queries_per_kv, dim=1)
 
-        assert attention_mask is not None
-        attn_weights = attn_weights + attention_mask
-
-        # Apply the softmax
+        # [batch_size, n_local_heads, input_len, max_seq_len]
+        scores = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if (
+            self.attn_type == AttentionType.LOCAL_SLIDING
+            and self.sliding_window_size is not None
+        ):
+            all_ones = torch.ones_like(attention_mask)
+            sliding_mask = torch.triu(
+                all_ones, -1 * self.sliding_window_size + 1
+            ) * torch.tril(all_ones, self.sliding_window_size - 1)
+            attention_mask = torch.where(sliding_mask == 1, attention_mask, -2.3819763e38)
+        if self.attn_logit_softcapping is not None:
+            scores = scores / self.attn_logit_softcapping
+            scores = torch.tanh(scores)
+            scores = scores * self.attn_logit_softcapping
+        scores = scores + attention_mask
         # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # Apply the dropout
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        # Multiply by the values. [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch_Size, Num_Heads_KV, Seq_Len_KV, Head_Dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
-        attn_output = torch.matmul(attn_weights, value_states)
+        scores = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # [batch_size, n_local_heads, input_len, head_dim]
+        output = torch.matmul(scores, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
         # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim]
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        output = output.transpose(1, 2).contiguous()
         # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
-        attn_output = attn_output.view(bsz, q_len, -1)
+        output = output.view(batch_size, input_len, -1)
         # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
-        attn_output = self.o_proj(attn_output)
+        output = self.o_proj(output)
+        # [batch_size, input_len, hidden_dim]
+        return output
 
-        return attn_output, attn_weights
 
-class GemmaDecoderLayer(nn.Module):
-
-    def __init__(self, config: GemmaConfig, layer_idx: int):
+class Gemma2DecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: GemmaConfig,
+        attn_type: AttentionType,
+    ):
         super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
-
-        self.mlp = GemmaMLP(config)
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = GemmaAttention(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            attn_logit_softcapping=config.attn_logit_softcapping,
+            query_pre_attn_scalar=config.query_pre_attn_scalar,
+            head_dim=config.head_dim,
+            quant=config.quant,
+            attn_type=attn_type,
+            sliding_window_size=config.sliding_window_size,
+            config=config,
+        )
+        self.mlp = GemmaMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            quant=config.quant,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if config.use_pre_ffw_norm
+            else None
+        )
+        self.post_feedforward_layernorm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if config.use_post_ffw_norm
+            else None
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        kv_cache: Optional[KVCache] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        position_ids: torch.Tensor,
+        kv_cache: KVCache,
+        layer_idx: int,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Self Attention
         residual = hidden_states
-        # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = self.input_layernorm(hidden_states)
-
-        # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states, _, = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
             position_ids=position_ids,
             kv_cache=kv_cache,
+            layer_idx=layer_idx,
+            attention_mask=attention_mask,
         )
-        # [Batch_Size, Seq_Len, Hidden_Size]
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # [Batch_Size, Seq_Len, Hidden_Size]
+        # MLP
         residual = hidden_states
-        # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        # [Batch_Size, Seq_Len, Hidden_Size]
+        if self.pre_feedforward_layernorm is not None:
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        # [Batch_Size, Seq_Len, Hidden_Size]
+        if self.post_feedforward_layernorm is not None:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
+
 
 class GemmaModel(nn.Module):
 
     def __init__(self, config: GemmaConfig):
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        padding_idx = 0
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList()
+        for i in range(config.num_hidden_layers):
+            attn_type = (
+                config.attn_types[i]
+                if config.attn_types is not None
+                else AttentionType.GLOBAL
+            )
+            self.layers.append(Gemma2DecoderLayer(config, attn_type))
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self):
         return self.embed_tokens
 
-    # Ignore copy
     def forward(
         self,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        kv_cache: Optional[KVCache] = None,
-    ) -> torch.FloatTensor:
-        # [Batch_Size, Seq_Len, Hidden_Size]
-        hidden_states = inputs_embeds
-        # [Batch_Size, Seq_Len, Hidden_Size]
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: KVCache,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
-
-        for decoder_layer in self.layers:
-            # [Batch_Size, Seq_Len, Hidden_Size]
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
+        for i in range(len(self.layers)):
+            layer = self.layers[i]
+            hidden_states = layer(
+                hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache=kv_cache,
+                layer_idx=i,
+                attention_mask=attention_mask,
             )
-
-        # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = self.norm(hidden_states)
-
-        # [Batch_Size, Seq_Len, Hidden_Size]
         return hidden_states
+
 
 class GemmaForCausalLM(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.model = GemmaModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model = GemmaModel(self.config)
+        self.vocab_size = self.config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
-    
+
     def tie_weights(self):
         self.lm_head.weight = self.model.embed_tokens.weight
 
@@ -406,7 +491,7 @@ class GemmaForCausalLM(nn.Module):
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            hidden_states=inputs_embeds,
             kv_cache=kv_cache,
         )
 
@@ -424,6 +509,7 @@ class GemmaForCausalLM(nn.Module):
 
         return return_data
 
+
 class PaliGemmaMultiModalProjector(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
         super().__init__()
@@ -433,6 +519,7 @@ class PaliGemmaMultiModalProjector(nn.Module):
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Projection_Dim]
         hidden_states = self.linear(image_features)
         return hidden_states
+
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
@@ -523,7 +610,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         input_ids: torch.LongTensor = None,
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
+        kv_cache: List[KVCache] = None, #TODO: Change back here qm
     ) -> Tuple:
 
         # Make sure the input is right-padded
@@ -546,7 +633,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            kv_cache=kv_cache,
+            kv_cache=kv_cache
         )
 
         return outputs

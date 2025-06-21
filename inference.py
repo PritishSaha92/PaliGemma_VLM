@@ -79,7 +79,9 @@ def test_inference(
     # Decode the generated tokens
     decoded = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
-    print(prompt + decoded)
+    print("\n-----------------------------------------------------------------------")
+    print(f"{prompt}:\n{decoded}")
+    print("-----------------------------------------------------------------------\n")
 
 
 def _sample_top_p(probs: torch.Tensor, p: float):
@@ -130,19 +132,29 @@ def main(
     processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
 
     print("Running inference")
-    with torch.no_grad():
-        test_inference(
-            model,
-            processor,
-            device,
-            prompt,
-            image_file_path,
-            max_tokens_to_generate,
-            temperature,
-            top_p,
-            do_sample,
-        )
+    while True:
+
+        prompt = "answer en " + prompt
+
+        with torch.no_grad():
+            test_inference(
+                model,
+                processor,
+                device,
+                prompt,
+                image_file_path,
+                max_tokens_to_generate,
+                temperature,
+                top_p,
+                do_sample,
+            )
+        prompt = input("Enter next your prompt (else say stop): ")
+
+        if prompt == "stop":
+            print("Exiting...")
+            break
 
 
 if __name__ == "__main__":
+    torch.cuda.empty_cache()
     fire.Fire(main)

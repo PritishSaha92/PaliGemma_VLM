@@ -162,3 +162,4 @@ cython_debug/
 #.idea/
 
 test_images/
+paligemma2-3b-ft-docci-448/
